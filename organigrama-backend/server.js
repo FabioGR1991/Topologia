@@ -1,128 +1,265 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
+const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
+const path = require('node:path');
+
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+const { authenticateToken, requireAdmin } = require('./authMiddleware');
+const { all, db, get, migrate, transaction } = require('./database');
+const {
+  parse,
+  parseUserId,
+  positionBatchSchema,
+  relationshipsSchema,
+  userSchema,
+} = require('./validation');
 
 const app = express();
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
+const HOST = process.env.HOST || '127.0.0.1';
+const allowedOrigins = new Set(
+  (process.env.CORS_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
 
-app.use(cors());
-app.use(express.json());
+app.use(helmet({ hsts: process.env.NODE_ENV === 'production' ? undefined : false }));
+app.use(cors({
+  origin(origin, callback) {
+    callback(null, !origin || allowedOrigins.has(origin));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-User-Role'],
+  maxAge: 600,
+}));
+app.use('/api', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Demasiadas solicitudes; inténtalo más tarde' },
+}));
+app.use(express.json({ limit: '32kb', strict: true }));
+app.use('/api', authenticateToken, requireAdmin);
 
-const db = new sqlite3.Database('./organigrama.db', (err) => {
-  if (err) console.error('Error DB:', err.message);
-  else console.log('Base de Datos SQLite conectada.');
-});
+function apiError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
 
-// Inicialización de la DB y migración automática de columnas
-db.serialize(() => {
-  // 1. Crear tabla si no existe (incluye email)
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      role TEXT NOT NULL,
-      department TEXT NOT NULL,
-      photoUrl TEXT,
-      email TEXT,
-      functions TEXT,
-      permissions TEXT,
-      reportsToId INTEGER,
-      positionX REAL DEFAULT 100,
-      positionY REAL DEFAULT 100
-    )
-  `);
+function sendError(res, error) {
+  const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+  if (statusCode >= 500) {
+    console.error('API operation failed', { code: error.code || 'INTERNAL' });
+  }
 
-  // 2. Agregar columnas si la tabla ya existía antes
-  db.run(`ALTER TABLE users ADD COLUMN positionX REAL DEFAULT 100`, () => {});
-  db.run(`ALTER TABLE users ADD COLUMN positionY REAL DEFAULT 100`, () => {});
-  db.run(`ALTER TABLE users ADD COLUMN email TEXT`, () => {});
-});
+  const body = { error: statusCode >= 500 ? 'Error interno del servidor' : error.message };
+  if (statusCode === 400 && error.details) body.details = error.details;
+  return res.status(statusCode).json(body);
+}
 
-// 1. Obtener todos los usuarios
-app.get('/api/users', (req, res) => {
-  db.all("SELECT * FROM users", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const users = rows.map(u => ({
-      ...u,
-      functions: JSON.parse(u.functions || "[]"),
-      permissions: JSON.parse(u.permissions || "[]")
+function decodeUsers(rows) {
+  try {
+    return rows.map((user) => ({
+      ...user,
+      functions: JSON.parse(user.functions || '[]'),
+      permissions: JSON.parse(user.permissions || '[]'),
     }));
-    res.json(users);
-  });
+  } catch {
+    throw apiError(500, 'No se pudieron leer los datos');
+  }
+}
+
+async function validateRelationshipUpdates(relationships, queryAll) {
+  const users = await queryAll('SELECT id, reportsToId FROM users');
+  const parentByUserId = new Map(users.map((user) => [user.id, user.reportsToId]));
+
+  for (const relationship of relationships) {
+    if (!parentByUserId.has(relationship.userId)) {
+      throw apiError(404, 'No se encontró uno de los usuarios indicados');
+    }
+    if (relationship.reportsToId !== null && !parentByUserId.has(relationship.reportsToId)) {
+      throw apiError(404, 'No se encontró uno de los superiores indicados');
+    }
+    parentByUserId.set(relationship.userId, relationship.reportsToId);
+  }
+
+  for (const relationship of relationships) {
+    const visited = new Set();
+    let currentId = relationship.userId;
+    while (currentId !== null) {
+      if (visited.has(currentId)) {
+        throw apiError(409, 'La relación crearía un ciclo jerárquico');
+      }
+      visited.add(currentId);
+      currentId = parentByUserId.get(currentId) ?? null;
+    }
+  }
+}
+
+function ensureUniqueIds(items, key, label) {
+  const ids = items.map((item) => item[key]);
+  if (new Set(ids).size !== ids.length) {
+    throw apiError(400, `La solicitud contiene ${label} duplicados`);
+  }
+}
+
+app.get('/api/users', async (req, res) => {
+  try {
+    const rows = await all('SELECT * FROM users ORDER BY id');
+    return res.json(decodeUsers(rows));
+  } catch (error) {
+    return sendError(res, error);
+  }
 });
 
-// 2. Guardar posiciones al arrastrar tarjetas
-app.put('/api/users/positions', (req, res) => {
-  const { nodes } = req.body;
-  if (!nodes || !Array.isArray(nodes)) return res.json({ message: "Sin nodos para actualizar" });
+app.put('/api/users/positions', async (req, res) => {
+  try {
+    const { nodes } = parse(positionBatchSchema, req.body);
+    ensureUniqueIds(nodes, 'id', 'identificadores');
 
-  const stmt = db.prepare("UPDATE users SET positionX = ?, positionY = ? WHERE id = ?");
-  nodes.forEach(node => {
-    stmt.run(node.x, node.y, node.id);
-  });
-  stmt.finalize();
+    await transaction(async (tx) => {
+      const existingIds = new Set((await tx.all('SELECT id FROM users')).map((user) => user.id));
+      if (nodes.some((node) => !existingIds.has(node.id))) {
+        throw apiError(404, 'No se encontró uno de los usuarios indicados');
+      }
+      for (const node of nodes) {
+        await tx.run('UPDATE users SET positionX = ?, positionY = ? WHERE id = ?', [node.x, node.y, node.id]);
+      }
+    });
 
-  res.json({ message: "Posiciones guardadas" });
+    return res.json({ message: 'Posiciones guardadas', updated: nodes.length });
+  } catch (error) {
+    return sendError(res, error);
+  }
 });
 
-// 3. Crear nuevo usuario
-app.post('/api/users', (req, res) => {
-  const { name, role, department, photoUrl, functions, permissions, reportsToId, email, positionX, positionY } = req.body;
+app.put('/api/users/relationships', async (req, res) => {
+  try {
+    const { relationships } = parse(relationshipsSchema, req.body);
+    ensureUniqueIds(relationships, 'userId', 'usuarios');
 
-  const sql = `INSERT INTO users (name, role, department, photoUrl, functions, permissions, reportsToId, email, positionX, positionY) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    await transaction(async (tx) => {
+      await validateRelationshipUpdates(relationships, tx.all);
+      for (const relationship of relationships) {
+        await tx.run('UPDATE users SET reportsToId = ? WHERE id = ?', [
+          relationship.reportsToId,
+          relationship.userId,
+        ]);
+      }
+    });
 
-  const params = [
-    name, 
-    role, 
-    department, 
-    photoUrl, 
-    JSON.stringify(functions || []), 
-    JSON.stringify(permissions || []), 
-    reportsToId || null,
-    email || null,
-    positionX || 100,
-    positionY || 100
-  ];
-
-  db.run(sql, params, function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID, ...req.body });
-  });
+    return res.json({ message: 'Relaciones actualizadas', updated: relationships.length });
+  } catch (error) {
+    return sendError(res, error);
+  }
 });
 
-// 4. Actualizar usuario (AQUÍ YA INCLUYED EMAIL)
-app.put('/api/users/:id', (req, res) => {
-  const { id } = req.params;
-  const { name, role, department, photoUrl, functions, permissions, reportsToId, email } = req.body;
+app.post('/api/users', async (req, res) => {
+  try {
+    const user = parse(userSchema, req.body);
+    const result = await transaction(async (tx) => {
+      if (user.reportsToId !== null) {
+        const parent = await tx.get('SELECT id FROM users WHERE id = ?', [user.reportsToId]);
+        if (!parent) throw apiError(404, 'No se encontró el superior indicado');
+      }
+      return tx.run(`
+        INSERT INTO users (
+          name, role, department, photoUrl, functions, permissions, reportsToId,
+          email, positionX, positionY
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        user.name,
+        user.role,
+        user.department,
+        user.photoUrl,
+        JSON.stringify(user.functions),
+        JSON.stringify(user.permissions),
+        user.reportsToId,
+        user.email,
+        user.positionX,
+        user.positionY,
+      ]);
+    });
 
-  const sql = `
-    UPDATE users 
-    SET name = ?, role = ?, department = ?, photoUrl = ?, functions = ?, permissions = ?, reportsToId = ?, email = ?
-    WHERE id = ?
-  `;
-
-  db.run(sql, [
-    name, role, department, photoUrl,
-    JSON.stringify(functions || []),
-    JSON.stringify(permissions || []),
-    reportsToId || null,
-    email || null,
-    id
-  ], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Actualizado" });
-  });
+    return res.status(201).json({ id: result.lastID, ...user });
+  } catch (error) {
+    return sendError(res, error);
+  }
 });
 
-// 5. Eliminar usuario
-app.delete('/api/users/:id', (req, res) => {
-  db.run("DELETE FROM users WHERE id = ?", req.params.id, function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Eliminado" });
-  });
+app.put('/api/users/:id', async (req, res) => {
+  try {
+    const id = parseUserId(req.params.id);
+    const user = parse(userSchema, req.body);
+
+    await transaction(async (tx) => {
+      const existing = await tx.get('SELECT id FROM users WHERE id = ?', [id]);
+      if (!existing) throw apiError(404, 'No se encontró el usuario');
+      await validateRelationshipUpdates([{ userId: id, reportsToId: user.reportsToId }], tx.all);
+      await tx.run(`
+        UPDATE users
+        SET name = ?, role = ?, department = ?, photoUrl = ?, functions = ?,
+            permissions = ?, reportsToId = ?, email = ?
+        WHERE id = ?
+      `, [
+        user.name,
+        user.role,
+        user.department,
+        user.photoUrl,
+        JSON.stringify(user.functions),
+        JSON.stringify(user.permissions),
+        user.reportsToId,
+        user.email,
+        id,
+      ]);
+    });
+
+    return res.json({ message: 'Usuario actualizado' });
+  } catch (error) {
+    return sendError(res, error);
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Backend corriendo en http://localhost:${PORT}`);
+app.delete('/api/users/:id', async (req, res) => {
+  try {
+    const id = parseUserId(req.params.id);
+    await transaction(async (tx) => {
+      const existing = await tx.get('SELECT id FROM users WHERE id = ?', [id]);
+      if (!existing) throw apiError(404, 'No se encontró el usuario');
+      await tx.run('DELETE FROM users WHERE id = ?', [id]);
+    });
+
+    return res.json({ message: 'Usuario eliminado' });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  if (error.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'La solicitud excede el tamaño permitido' });
+  }
+  if (error.status === 400) {
+    return res.status(400).json({ error: 'Solicitud JSON inválida' });
+  }
+  console.error('Unhandled API error', { code: error.code || 'INTERNAL' });
+  return res.status(500).json({ error: 'Error interno del servidor' });
+});
+
+async function start() {
+  await migrate();
+  app.listen(PORT, HOST, () => {
+    console.log(`Backend corriendo en http://${HOST}:${PORT} (auth: ${process.env.AUTH_MODE || 'disabled'})`);
+  });
+}
+
+start().catch((error) => {
+  console.error('Database initialization failed', { code: error.code || 'MIGRATION_FAILED' });
+  db.close(() => process.exit(1));
 });

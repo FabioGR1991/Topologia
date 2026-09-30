@@ -1,0 +1,8 @@
+node_modules/
+organigrama.db
+organigrama.db-journal
+organigrama.db-shm
+organigrama.db-wal
+.env
+.env.*
+!.env.example
